@@ -37,6 +37,9 @@ async function init(): Promise<void> {
     if (argv.username) {
         logger.info(`Username: ${argv.username}`);
     }
+    if (argv.password) {
+        logger.info('Password provided');
+    }
 
     if (argv.simulate) {
         logger.warn('Simulate mode, there will be no video downloaded. \n');
@@ -44,7 +47,7 @@ async function init(): Promise<void> {
 }
 
 
-async function DoInteractiveLogin(url: string, username?: string): Promise<Session> {
+async function DoInteractiveLogin(url: string, keepLoginCookies: boolean, username?: string, password?: string): Promise<Session> {
 
     logger.info('Launching headless Chrome to perform the OpenID Connect dance...');
 
@@ -61,27 +64,60 @@ async function DoInteractiveLogin(url: string, username?: string): Promise<Sessi
     const page: puppeteer.Page = (await browser.pages())[0];
 
     logger.info('Navigating to login page...');
-    await page.goto(url, { waitUntil: 'load' });
-
-    try {
-        if (username) {
-            await page.waitForSelector('input[type="email"]', {timeout: 3000});
-            await page.keyboard.type(username);
-            await page.click('input[type="submit"]');
+    const response = await page.goto(url, { waitUntil: 'load' });
+    //if the user selected remind me he gets redirected to stream website without need to login, so we check that case
+    //and avoid all if he's already connected
+    if(!response?.url().endsWith('microsoftstream.com/')) {
+        try {
+            if (username) {
+                await page.waitForSelector('input[type="email"]', {timeout: 3000});
+                await page.keyboard.type(username);
+                await page.click('input[type="submit"]');
+            }
+            else {
+                /* If a username was not provided we let the user take actions that
+                lead up to the video page. */
+            }
         }
-        else {
-            /* If a username was not provided we let the user take actions that
-            lead up to the video page. */
+        catch (e) {
+            /* If there is no email input selector we aren't in the login module,
+            we are probably using the cache to aid the login.
+            It could finish the login on its own if the user said 'yes' when asked to
+            remember the credentials or it could still prompt the user for a password */
         }
-    }
-    catch (e) {
-        /* If there is no email input selector we aren't in the login module,
-        we are probably using the cache to aid the login.
-        It could finish the login on its own if the user said 'yes' when asked to
-        remember the credentials or it could still prompt the user for a password */
-    }
+        if(username && password) {
+            try {
+                await browser.waitForTarget((target: puppeteer.Target) => target.url().startsWith('https://idp.unibo.it/adfs/ls/'), { timeout: 30000 });
+                logger.info('Landed on UniBo login form');
 
-    await browser.waitForTarget((target: puppeteer.Target) => target.url().endsWith('microsoftstream.com/'), { timeout: 150000 });
+                await page.waitForSelector('input[type="password"]', {timeout: 5000});
+                await page.keyboard.type(password);
+                await page.click('#submitButton');
+            }
+            catch(e) {
+                //no password selector
+            }
+        }
+        //If the user asked to remain connected, we choose "remember me", otherwise we click no and continue
+        logger.info('Waiting for stay connected page or final page.');
+        const target = await browser.waitForTarget((target: puppeteer.Target) => target.url().endsWith('microsoftstream.com/') ||
+            target.url().startsWith('https://login.microsoftonline.com/login.srf'), { timeout: 150000 });
+
+        if(target.url().startsWith('https://login.microsoftonline.com/login.srf')) {
+            logger.info('Landed on stay connected page.');
+            await page.waitForSelector('input[name="DontShowAgain"]', {timeout: 5000});
+            if (keepLoginCookies) {
+                await page.click('input[name="DontShowAgain"]');
+                await page.click('input[type="submit"]');
+            }
+            else {
+                //we automatically click "no" to avoid user interaction
+                await page.click('#idBtn_Back');
+            }
+        }
+
+        await browser.waitForTarget((target: puppeteer.Target) => target.url().endsWith('microsoftstream.com/'), { timeout: 150000 });
+    }
     logger.info('We are logged in.');
 
     let session: Session | null = null;
@@ -271,7 +307,7 @@ async function main(): Promise<void> {
 
     let session: Session;
     // eslint-disable-next-line prefer-const
-    session = tokenCache.Read() ?? await DoInteractiveLogin('https://web.microsoftstream.com/', argv.username);
+    session = tokenCache.Read() ?? await DoInteractiveLogin('https://web.microsoftstream.com/', argv.keepLoginCookies, argv.username, argv.password);
 
     logger.verbose('Session and API info \n' +
         '\t API Gateway URL: '.cyan + session.ApiGatewayUri + '\n' +
